@@ -8,25 +8,29 @@ export default function App() {
   const [tool, setTool] = useState<'pen' | 'eraser'>('pen');
   const [color, setColor] = useState('#1a1a1a');
   const [size, setSize] = useState(5);
-  const [strictPalmRejection, setStrictPalmRejection] = useState(true);
+  const [rejectionMode, setRejectionMode] = useState<'pen_only' | 'smart' | 'none'>('pen_only');
   
   // Debug info
-  const [lastPointerType, setLastPointerType] = useState<string>('none');
   const [rejectedTouches, setRejectedTouches] = useState(0);
+  const [debugLogs, setDebugLogs] = useState<string[]>([]);
 
-  // Drawing state refs (to avoid re-renders during drawing)
+  const addLog = (msg: string) => {
+    setDebugLogs(prev => [msg, ...prev].slice(0, 6));
+  };
+
+  // Drawing state refs
   const isDrawing = useRef(false);
   const lastPos = useRef({ x: 0, y: 0 });
   const activePointerId = useRef<number | null>(null);
+  const activePointerType = useRef<string | null>(null);
 
-  // Initialize canvas
+  // Initialize canvas & native touch listeners
   useEffect(() => {
     const canvas = canvasRef.current;
     const container = containerRef.current;
     if (!canvas || !container) return;
 
     const resizeCanvas = () => {
-      // Save current drawing
       const ctx = canvas.getContext('2d');
       const tempCanvas = document.createElement('canvas');
       tempCanvas.width = canvas.width;
@@ -36,12 +40,10 @@ export default function App() {
         tempCtx.drawImage(canvas, 0, 0);
       }
 
-      // Resize
       const rect = container.getBoundingClientRect();
       canvas.width = rect.width;
       canvas.height = rect.height;
 
-      // Restore drawing or fill white
       if (ctx) {
         ctx.fillStyle = '#ffffff';
         ctx.fillRect(0, 0, canvas.width, canvas.height);
@@ -53,8 +55,28 @@ export default function App() {
 
     resizeCanvas();
     window.addEventListener('resize', resizeCanvas);
-    return () => window.removeEventListener('resize', resizeCanvas);
-  }, []);
+
+    // Native touch event prevention (Crucial for Android tablets)
+    const preventTouch = (e: TouchEvent) => {
+      // Prevent default to stop scrolling/zooming and browser gesture interference
+      if (rejectionMode !== 'none') {
+        e.preventDefault();
+      }
+    };
+
+    canvas.addEventListener('touchstart', preventTouch, { passive: false });
+    canvas.addEventListener('touchmove', preventTouch, { passive: false });
+    canvas.addEventListener('touchend', preventTouch, { passive: false });
+    canvas.addEventListener('touchcancel', preventTouch, { passive: false });
+
+    return () => {
+      window.removeEventListener('resize', resizeCanvas);
+      canvas.removeEventListener('touchstart', preventTouch);
+      canvas.removeEventListener('touchmove', preventTouch);
+      canvas.removeEventListener('touchend', preventTouch);
+      canvas.removeEventListener('touchcancel', preventTouch);
+    };
+  }, [rejectionMode]);
 
   const clearCanvas = () => {
     const canvas = canvasRef.current;
@@ -63,6 +85,7 @@ export default function App() {
     ctx.fillStyle = '#ffffff';
     ctx.fillRect(0, 0, canvas.width, canvas.height);
     setRejectedTouches(0);
+    setDebugLogs([]);
   };
 
   const getCoordinates = (e: React.PointerEvent<HTMLCanvasElement>) => {
@@ -76,23 +99,50 @@ export default function App() {
   };
 
   const handlePointerDown = (e: React.PointerEvent<HTMLCanvasElement>) => {
-    setLastPointerType(e.pointerType);
-    
-    // Palm rejection logic
-    if (strictPalmRejection && e.pointerType !== 'pen') {
-      if (e.pointerType === 'touch') {
-        setRejectedTouches(prev => prev + 1);
+    const info = `${e.pointerType} (w:${e.width || 0}, h:${e.height || 0}, p:${e.pressure?.toFixed(2) || 0})`;
+
+    let isRejected = false;
+    let reason = '';
+
+    if (rejectionMode === 'pen_only') {
+      if (e.pointerType !== 'pen') {
+        isRejected = true;
+        reason = 'Not a pen';
       }
+    } else if (rejectionMode === 'smart') {
+      if (e.pointerType === 'touch') {
+        // Smart rejection: if contact area is large, it's likely a palm
+        if ((e.width && e.width > 15) || (e.height && e.height > 15)) {
+          isRejected = true;
+          reason = `Large area (${e.width}x${e.height})`;
+        }
+      }
+    }
+
+    if (isRejected) {
+      setRejectedTouches(prev => prev + 1);
+      addLog(`❌ Rejected: ${info} - ${reason}`);
       return;
     }
 
-    // Only allow one pointer to draw at a time
-    if (activePointerId.current !== null) return;
+    addLog(`✅ Accepted: ${info}`);
+
+    // If we are already drawing with a touch, but a PEN comes in, override it
+    if (activePointerId.current !== null) {
+      if (e.pointerType === 'pen' && activePointerType.current !== 'pen') {
+        // Override
+        activePointerId.current = e.pointerId;
+        activePointerType.current = 'pen';
+      } else {
+        return; // Ignore secondary touches
+      }
+    } else {
+      activePointerId.current = e.pointerId;
+      activePointerType.current = e.pointerType;
+    }
     
     isDrawing.current = true;
-    activePointerId.current = e.pointerId;
     lastPos.current = getCoordinates(e);
-    
     e.currentTarget.setPointerCapture(e.pointerId);
   };
 
@@ -107,7 +157,6 @@ export default function App() {
     
     // Use pressure for pen, default to 0.5 for others
     const pressure = e.pointerType === 'pen' ? e.pressure : 0.5;
-    // Simple pressure dynamics: size varies from 0.5x to 1.5x based on pressure
     const pressureMultiplier = pressure > 0 ? (pressure * 1.5 + 0.2) : 1;
     const currentSize = size * pressureMultiplier;
 
@@ -117,7 +166,7 @@ export default function App() {
     
     if (tool === 'eraser') {
       ctx.strokeStyle = '#ffffff';
-      ctx.lineWidth = size * 3; // Eraser is usually bigger
+      ctx.lineWidth = size * 3;
     } else {
       ctx.strokeStyle = color;
       ctx.lineWidth = currentSize;
@@ -134,6 +183,7 @@ export default function App() {
     if (e.pointerId === activePointerId.current) {
       isDrawing.current = false;
       activePointerId.current = null;
+      activePointerType.current = null;
       e.currentTarget.releasePointerCapture(e.pointerId);
     }
   };
@@ -148,7 +198,7 @@ export default function App() {
           </div>
           <div>
             <h1 className="font-bold text-lg leading-tight">Studio Canvas</h1>
-            <p className="text-xs text-gray-500 font-medium">Palm Rejection Demo</p>
+            <p className="text-xs text-gray-500 font-medium">Advanced Palm Rejection</p>
           </div>
         </div>
 
@@ -211,28 +261,56 @@ export default function App() {
       {/* Main Content */}
       <main className="flex-1 relative flex">
         {/* Sidebar Settings */}
-        <aside className="w-64 bg-white border-r border-gray-200 p-6 flex flex-col gap-6 z-10 shadow-[4px_0_24px_rgba(0,0,0,0.02)]">
+        <aside className="w-80 bg-white border-r border-gray-200 p-6 flex flex-col gap-6 z-10 shadow-[4px_0_24px_rgba(0,0,0,0.02)] overflow-y-auto">
           <div className="space-y-4">
             <h2 className="text-sm font-bold uppercase tracking-wider text-gray-400 flex items-center gap-2">
               <Settings2 size={16} />
-              Input Settings
+              Rejection Mode
             </h2>
             
-            <div className="bg-gray-50 rounded-xl p-4 border border-gray-100">
-              <label className="flex items-start gap-3 cursor-pointer group">
-                <div className="relative flex items-center justify-center mt-0.5">
-                  <input 
-                    type="checkbox" 
-                    className="sr-only"
-                    checked={strictPalmRejection}
-                    onChange={(e) => setStrictPalmRejection(e.target.checked)}
-                  />
-                  <div className={`w-10 h-6 rounded-full transition-colors ${strictPalmRejection ? 'bg-blue-600' : 'bg-gray-300'}`}></div>
-                  <div className={`absolute left-1 top-1 bg-white w-4 h-4 rounded-full transition-transform ${strictPalmRejection ? 'translate-x-4' : 'translate-x-0'}`}></div>
-                </div>
+            <div className="flex flex-col gap-3">
+              <label className={`flex items-start gap-3 p-3 rounded-xl border cursor-pointer transition-colors ${rejectionMode === 'pen_only' ? 'bg-blue-50 border-blue-200' : 'bg-white border-gray-200 hover:bg-gray-50'}`}>
+                <input 
+                  type="radio" 
+                  name="rejectionMode"
+                  value="pen_only"
+                  checked={rejectionMode === 'pen_only'}
+                  onChange={() => setRejectionMode('pen_only')}
+                  className="mt-1 accent-blue-600"
+                />
                 <div>
-                  <span className="block text-sm font-semibold text-gray-900 group-hover:text-blue-600 transition-colors">Strict Palm Rejection</span>
-                  <span className="block text-xs text-gray-500 mt-1">Only allow drawing with a stylus/pen. Ignores touch and mouse inputs.</span>
+                  <span className={`block text-sm font-semibold ${rejectionMode === 'pen_only' ? 'text-blue-700' : 'text-gray-900'}`}>Pen Only (Strict)</span>
+                  <span className="block text-xs text-gray-500 mt-0.5">Chỉ nhận diện bút (pointerType = 'pen'). Tốt nhất nếu tablet hỗ trợ chuẩn.</span>
+                </div>
+              </label>
+
+              <label className={`flex items-start gap-3 p-3 rounded-xl border cursor-pointer transition-colors ${rejectionMode === 'smart' ? 'bg-blue-50 border-blue-200' : 'bg-white border-gray-200 hover:bg-gray-50'}`}>
+                <input 
+                  type="radio" 
+                  name="rejectionMode"
+                  value="smart"
+                  checked={rejectionMode === 'smart'}
+                  onChange={() => setRejectionMode('smart')}
+                  className="mt-1 accent-blue-600"
+                />
+                <div>
+                  <span className={`block text-sm font-semibold ${rejectionMode === 'smart' ? 'text-blue-700' : 'text-gray-900'}`}>Smart (Area Based)</span>
+                  <span className="block text-xs text-gray-500 mt-0.5">Từ chối các điểm chạm có diện tích lớn (lòng bàn tay). Dùng khi tablet nhận bút là ngón tay.</span>
+                </div>
+              </label>
+
+              <label className={`flex items-start gap-3 p-3 rounded-xl border cursor-pointer transition-colors ${rejectionMode === 'none' ? 'bg-blue-50 border-blue-200' : 'bg-white border-gray-200 hover:bg-gray-50'}`}>
+                <input 
+                  type="radio" 
+                  name="rejectionMode"
+                  value="none"
+                  checked={rejectionMode === 'none'}
+                  onChange={() => setRejectionMode('none')}
+                  className="mt-1 accent-blue-600"
+                />
+                <div>
+                  <span className={`block text-sm font-semibold ${rejectionMode === 'none' ? 'text-blue-700' : 'text-gray-900'}`}>None (Allow All)</span>
+                  <span className="block text-xs text-gray-500 mt-0.5">Nhận mọi thao tác chạm. Không có palm rejection.</span>
                 </div>
               </label>
             </div>
@@ -241,28 +319,28 @@ export default function App() {
           <div className="space-y-4 mt-auto">
             <h2 className="text-sm font-bold uppercase tracking-wider text-gray-400 flex items-center gap-2">
               <Info size={16} />
-              Debug Info
+              Debug Log
             </h2>
-            <div className="bg-slate-900 text-slate-300 rounded-xl p-4 text-xs font-mono space-y-2 shadow-inner">
-              <div className="flex justify-between">
-                <span>Last Input:</span>
-                <span className={`font-bold ${lastPointerType === 'pen' ? 'text-green-400' : lastPointerType === 'touch' ? 'text-orange-400' : 'text-blue-400'}`}>
-                  {lastPointerType}
-                </span>
+            <div className="bg-slate-900 text-slate-300 rounded-xl p-4 text-xs font-mono space-y-3 shadow-inner">
+              <div className="flex justify-between items-center border-b border-slate-700 pb-2">
+                <span>Rejected:</span>
+                <span className="text-red-400 font-bold text-sm bg-red-400/10 px-2 py-0.5 rounded">{rejectedTouches}</span>
               </div>
-              <div className="flex justify-between">
-                <span>Rejected Touches:</span>
-                <span className="text-red-400 font-bold">{rejectedTouches}</span>
-              </div>
-              <div className="flex justify-between">
-                <span>Rejection Status:</span>
-                <span className={strictPalmRejection ? 'text-green-400' : 'text-slate-500'}>
-                  {strictPalmRejection ? 'ACTIVE' : 'DISABLED'}
-                </span>
+              <div className="space-y-1.5">
+                <div className="text-slate-500 mb-1">Recent events:</div>
+                {debugLogs.length === 0 ? (
+                  <div className="text-slate-600 italic">No events yet...</div>
+                ) : (
+                  debugLogs.map((log, i) => (
+                    <div key={i} className={`truncate ${log.startsWith('✅') ? 'text-green-400' : 'text-red-400'}`}>
+                      {log}
+                    </div>
+                  ))
+                )}
               </div>
             </div>
-            <p className="text-[10px] text-gray-400 leading-relaxed">
-              Try resting your palm on the screen while drawing with a pen. If strict mode is on, the palm touches will be ignored.
+            <p className="text-[11px] text-gray-500 leading-relaxed bg-blue-50 p-3 rounded-lg border border-blue-100">
+              <strong className="text-blue-700">Mẹo:</strong> Hãy thử vẽ bằng bút và xem log hiện chữ gì. Nếu bút hiện là <code>touch</code>, hãy chuyển sang chế độ <strong>Smart</strong>.
             </p>
           </div>
         </aside>
@@ -271,7 +349,7 @@ export default function App() {
         <div 
           ref={containerRef} 
           className="flex-1 relative bg-gray-200 cursor-crosshair overflow-hidden"
-          style={{ touchAction: 'none' }} // Prevent browser scrolling/zooming
+          style={{ touchAction: 'none' }}
         >
           <canvas
             ref={canvasRef}
