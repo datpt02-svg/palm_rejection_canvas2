@@ -1,0 +1,6 @@
+{
+  "name": "Palm Rejection Canvas",
+  "description": "A drawing application optimized for tablets with strict palm rejection support using Pointer Events.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}
